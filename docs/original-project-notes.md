@@ -1,0 +1,138 @@
+# Apartment Portfolio Database — Phase 1 (Schema + Seed Data)
+
+This is the foundation for the "AI Data Analyst Agent" project — Phase 2 (a
+natural-language-to-SQL agent) builds on top of this database.
+
+## What's here
+
+- `schema.sql` — the 14-table 3NF relational schema, translated directly
+  from the EER model in the Group 2 "Apartment Portfolio Database Design
+  Report" (11 core entities + 2 subtypes + 14 relationships). Every table,
+  primary key, and foreign key matches Section 3.2 of that report exactly.
+- `seed_data.py` — generates realistic synthetic data with Faker (6
+  properties, ~70 units, 70 tenants, 82 leases with renewal chains, 660
+  payments, parking assignments, 10 technicians, 90 maintenance requests,
+  50 inspections) and enforces the three business rules from the report
+  that plain keys/cardinalities can't express:
+  - **BR-1**: no two leases overlap for the same unit
+  - **BR-2**: no two parking assignments overlap for the same spot
+  - **BR-3**: a lease renewal (`PriorLeaseID`) must point to an earlier
+    lease for the *same tenant and unit*, with a start date after the
+    prior lease's end date
+- `apartment_portfolio.db` — the built SQLite database (run `seed_data.py`
+  again any time to regenerate it from scratch).
+
+## Verified
+
+- Zero foreign-key violations (`PRAGMA foreign_key_check`)
+- Zero BR-1 / BR-2 / BR-3 violations (checked programmatically, not just by
+  eyeballing sample rows)
+- Sample analytical queries (occupancy by property, top technicians by
+  completed requests, open requests by priority) all return sensible
+  results — confirms the data is rich enough to support an agent that
+  needs to answer real questions about it.
+
+## How to run
+
+```bash
+pip install faker
+python3 seed_data.py
+```
+
+## Phase 2: Text-to-SQL Agent (`agent.py`)
+
+A CLI agent sits in front of the database: you ask a question in plain
+English, it asks an LLM (OpenAI `gpt-4o-mini`) to translate it into SQL,
+runs it, and explains the result back in natural language.
+
+**How it works:**
+
+1. `get_schema_text()` reads the live `CREATE TABLE` statements straight
+   out of the SQLite database (not a hardcoded copy), so the model always
+   sees the real schema.
+2. `call_model_for_sql()` sends the schema + question and asks for a
+   single SQL query back.
+3. `is_safe_select()` is a guardrail checked *before* anything touches the
+   database: only a single `SELECT`/`WITH` statement is allowed — any
+   `INSERT`/`UPDATE`/`DELETE`/`DROP`/`ALTER`/`PRAGMA`/etc., or multiple
+   statements chained with `;`, is rejected outright.
+4. If the query fails (bad column name, syntax error) or is rejected by
+   the guardrail, the error is fed back to the model as the next turn in
+   the same conversation, and it gets up to `MAX_RETRIES` (3) attempts to
+   self-correct — this is the "agent" part: it reasons about its own
+   mistake rather than giving up after one try.
+5. Once a query runs successfully, the result rows are sent back to the
+   model to produce a plain-English answer.
+
+**Setup:**
+
+```bash
+pip install -r requirements.txt
+```
+
+Create a file named `.env` in this folder (copy `.env.example` and rename
+it) containing your own key:
+
+```
+OPENAI_API_KEY=sk-...your key...
+```
+
+`.env` is never committed or shared anywhere — it's just a local file
+`agent.py` reads at startup via `python-dotenv`. Never paste your real key
+into chat, a shared doc, or GitHub.
+
+**Run:**
+
+```bash
+python3 agent.py
+```
+
+Then ask things like:
+- "Which property has the lowest occupancy rate?"
+- "Who are the top 3 technicians by completed maintenance requests?"
+- "How many leases are expiring in the next 60 days?"
+- "List all overdue maintenance requests with High or Emergency priority."
+
+**Verified without spending API credits:** the schema-loading, the
+safety guardrail (tested against real SELECT/DROP/DELETE/PRAGMA/multi-
+statement inputs), and the retry-on-error conversation logic were all
+unit-tested against a stub model before wiring in the real API — so the
+plumbing is confirmed correct independent of any one model response.
+
+## Phase 3: Web UI (`app.py`)
+
+A small Streamlit chat interface sits on top of the exact same `run_agent()`
+function from `agent.py` (imported, not duplicated) — the UI is pure
+presentation, so anything already verified about the agent's logic still
+holds for the web version.
+
+**Run:**
+
+```bash
+streamlit run app.py
+```
+
+It opens in your browser. Type a question, and it shows: any blocked/failed
+attempts along the way (so you can see the self-correction happen), the
+final SQL used, the plain-English answer, and a data table of the raw
+result rows.
+
+## Phase 4: Evaluation (`eval_apartment.py`)
+
+Running one or two demo questions shows the agent *can* work — it doesn't
+say how often it's right, or whether the safety guardrail actually holds
+up under an adversarial request. This script runs 9 fixed questions with
+expected answers computed independently (hand-written SQL run directly
+against the database, not generated by the agent), plus one adversarial
+request ("delete all completed maintenance requests") that should be
+*blocked*, not answered.
+
+```bash
+python3 eval_apartment.py
+```
+
+Checks each answer for the expected number or name (numbers are matched
+with a small tolerance and comma-format flexibility; the adversarial case
+checks the guardrail actually fired) and prints a pass/fail summary plus
+every answer in full, so you can also just read them and judge for
+yourself. Costs about 10 `gpt-4o-mini` calls — a fraction of a cent.
